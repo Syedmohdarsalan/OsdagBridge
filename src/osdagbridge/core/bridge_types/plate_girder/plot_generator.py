@@ -511,6 +511,73 @@ def _add_element_number_labels(ax, nodes, members, visible: bool = False):
 # GRILLAGE PLOT
 # =============================================================================
 
+def build_figure_transverse(nodes, members, label, *, values=None, plot_key=None, eng_scale=1.0):
+    """Draw each transverse element at its actual endpoints, including skew."""
+    fig = Figure(figsize=(14, 6), facecolor="white")
+    ax = fig.add_subplot(111, projection="3d", facecolor="white")
+    ax.view_init(elev=22, azim=-61)
+    ax.set_axis_off()
+
+    displacement = plot_key in DISP_MAP
+    moment = plot_key in FORCE_MAP and plot_key.startswith("M")
+    unit = "mm" if displacement else "kNm" if moment else "kN"
+    component = DISP_DISPLAY.get(plot_key) or FORCE_DISPLAY.get(plot_key)
+    ax.set_title(f"{label}  —  {component} ({unit})" if component else label)
+    v_scale = _value_plot_scale(eng_scale)
+    fig._eng_scale = v_scale
+
+    summary = {}
+    points = []
+    for tag, (first, last) in members.items():
+        xs, _, zs = zip(nodes[first], nodes[last])
+        ax.plot(xs, zs, [0, 0], color="slategrey", alpha=0.6, linewidth=1)
+        if values is None or tag not in values:
+            continue
+        pair = values[tag]
+        heights = [value * v_scale for value in pair]
+        color = "#6A1B9A" if displacement else "#C62828" if moment else "#1565C0"
+        ax.plot(xs, zs, heights, color=color, linewidth=1.8)
+        for x, z, height, value in zip(xs, zs, heights, pair):
+            ax.plot([x, x], [z, z], [0, height], color=color, alpha=0.4)
+            points.append((x, z, height, value))
+
+    if points:
+        low = min(points, key=lambda point: point[3])
+        high = max(points, key=lambda point: point[3])
+        summary["All"] = {"min": low[3], "max": high[3]}
+        for x, z, height, value in points:
+            ax.text(x, z, height, f" {value:.3g}", fontsize=7, color="#455A64", gid="all_vals")
+        for point, gid in ((high, "max_line"), (low, "min_line")):
+            x, z, height, value = point
+            ax.plot([x], [z], [height], marker="o", color="#263238", gid=gid)
+            ax.text(x, z, height, f" {value:.3g} {unit}", fontsize=8,
+                    fontweight="bold", gid=gid)
+    elif values is not None:
+        ax.text2D(0.5, 0.5, "No results for this load case and component",
+                  ha="center", transform=ax.transAxes)
+
+    selected_nodes = {n: nodes[n] for ends in members.values() for n in ends}
+    if selected_nodes:
+        xs, _, zs = zip(*selected_nodes.values())
+        heights = [0, *(point[2] for point in points)]
+        ax.set_xlim(min(xs) - 0.5, max(xs) + 0.5)
+        ax.set_ylim(min(zs) - 0.5, max(zs) + 0.5)
+        pad = max((max(heights) - min(heights)) * 0.08, 1e-6)
+        ax.set_zlim(min(heights) - pad, max(heights) + pad)
+        ax.set_box_aspect([max(1, max(xs) - min(xs)), max(1, max(zs) - min(zs)),
+                           max(1, (max(xs) - min(xs)) * 0.3)])
+        ax.scatter(xs, zs, np.zeros(len(xs)), color="#388E3C", s=8, depthshade=False)
+        _add_node_number_labels(ax, selected_nodes)
+        _add_element_number_labels(ax, selected_nodes, members)
+        _add_coordinate_triad(ax, selected_nodes, eng_scale=v_scale)
+        _set_value_axis_tick_formatter(ax, v_scale)
+    ax.set_xlabel("Span Length (m)")
+    ax.set_ylabel("Bridge Width (m)")
+    if component:
+        ax.set_zlabel(f"{component} ({unit})")
+    return fig, summary
+
+
 def build_figure_grillage(nodes, members, edge_dist=0.0, selected_girder="All"):
     """
     Build a 3-D matplotlib figure showing only the bridge grillage mesh.

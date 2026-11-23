@@ -10,6 +10,7 @@ bridge-wrapper dependency.
 
 from __future__ import annotations
 import json
+from math import isfinite
 from collections import OrderedDict
 from collections.abc import Mapping
 from pathlib import Path
@@ -92,6 +93,78 @@ def _build_nodes_members() -> tuple[dict, dict]:
         for e in ops.getEleTags()
     }
     return nodes, members
+
+
+END_DIAPHRAGMS = "End Diaphragms"
+INTERMEDIATE_CROSS_BRACINGS = "Intermediate Cross Bracings"
+TRANSVERSE_GROUPS = ("start_edge", "end_edge", "transverse_slab")
+
+
+def transverse_plot_members(model, result_data, members):
+    """Return the grillage tags representing diaphragms and bracings between girders."""
+    end_tags = {
+        int(tag)
+        for group in TRANSVERSE_GROUPS[:2]
+        for tag in model.get_element(member=group, options="elements")
+    }
+    girder_by_node = {
+        node: girder["index"]
+        for girder in result_data.get("girders", {}).values()
+        for node in girder["nodes"]
+    }
+    diaphragms = []
+    for tag in sorted(end_tags.intersection(members)):
+        first, last = members[tag]
+        if first in girder_by_node and last in girder_by_node:
+            if abs(girder_by_node[first] - girder_by_node[last]) == 1:
+                diaphragms.append(tag)
+
+    bracings = {
+        int(tag) for bracing in result_data.get("crossbracings", ())
+        for tag in bracing["members"]
+    }
+    bracings = sorted(bracings.intersection(members).difference(end_tags))
+    return {
+        label: tags for label, tags in (
+            (END_DIAPHRAGMS, diaphragms), (INTERMEDIATE_CROSS_BRACINGS, bracings),
+        ) if tags
+    }
+
+
+def transverse_loadcase_values(dataset, loadcase, members, components, *, displacement=False):
+    """Read signed element-end forces or nodal translations from one case."""
+    variable, dimension = ("displacements", "Node") if displacement else ("forces", "Element")
+    if variable not in dataset:
+        return {}
+
+    data = dataset[variable].sel(Loadcase=loadcase)
+    names = {str(name).lower(): name for name in data.coords["Component"].values}
+    if any(component.lower() not in names for component in components):
+        return {}
+
+    ids = set(data.coords[dimension].values)
+    tags = sorted({n for ends in members.values() for n in ends}.intersection(ids)
+                  if displacement else members.keys() & ids)
+    if not tags:
+        return {}
+    data = data.sel({
+        dimension: tags,
+        "Component": [names[component.lower()] for component in components],
+    }).transpose(dimension, "Component")
+    rows = dict(zip(tags, data.values.tolist()))
+    result = {}
+    for tag, (first, last) in members.items():
+        if displacement:
+            if first not in rows or last not in rows:
+                continue
+            pair = (rows[first][0] * 1000, rows[last][0] * 1000)
+        else:
+            if tag not in rows:
+                continue
+            pair = tuple(value / 1000 for value in rows[tag])
+        if all(isfinite(value) for value in pair):
+            result[tag] = pair
+    return result
 
 
 def dump_full_data(
@@ -408,18 +481,20 @@ def _build_full_data(model, edge_dist: float = 0.0, dataset=None, lazy: bool = F
     disp_components = [str(
         c) for c in ds0["displacements"].coords["Component"].values] if "displacements" in ds0.data_vars else []
 
-    # Classify members: longitudinal = both nodes share same Z and same Y
-    _z_tol = 1e-3
-    longitudinal_members = []
-    transverse_members = []
-    for tag, (n1, n2) in members.items():
-        if n1 not in nodes or n2 not in nodes:
-            continue
-        if (abs(nodes[n1][2] - nodes[n2][2]) < _z_tol and
-                abs(nodes[n1][1] - nodes[n2][1]) < _z_tol):
-            longitudinal_members.append(tag)
-        else:
-            transverse_members.append(tag)
+    # Prefer the model's transverse groups. Their tags remain accurate for
+    # skewed meshes and avoid treating shells or links as transverse beams.
+    transverse_members = sorted(
+        {tag for group in TRANSVERSE_GROUPS for tag in groups[group]}
+        .intersection(tag for tag, ends in members.items() if len(ends) == 2)
+    )
+    transverse_tags = set(transverse_members)
+    longitudinal_members = [
+        tag for tag, ends in members.items()
+        if tag not in transverse_tags and len(ends) == 2
+        and all(node in nodes for node in ends)
+        and abs(nodes[ends[0]][2] - nodes[ends[1]][2]) < 1e-3
+        and abs(nodes[ends[0]][1] - nodes[ends[1]][1]) < 1e-3
+    ]
 
     data: dict = {
         "nodes": {str(k): list(v) for k, v in nodes.items()},

@@ -1,10 +1,13 @@
+from copy import deepcopy
+from math import isfinite
+
 import os, yaml
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QMenuBar, QSplitter, QSizePolicy, QPushButton, QLineEdit, QComboBox, QFileDialog,
 )
 from PySide6.QtSvgWidgets import QSvgWidget
-from PySide6.QtCore import Qt, QFile, QTextStream, Signal, QTimer, QObject, QEvent, QThread
+from PySide6.QtCore import Qt, QFile, QTextStream, Signal, QSignalBlocker, QTimer, QObject, QEvent, QThread
 from PySide6.QtGui import QIcon, QAction, QKeySequence
 
 from osdagbridge.desktop.ui.docks.input_dock import InputDock
@@ -455,6 +458,7 @@ class CustomWindow(QWidget):
 
             # This is updated directly because 
             # there is some mapping that takes place in BridgeDualCADWidget which can worst the things
+            self.cad_comp_widget.update_from_osdag_inputs(self.input_dict)
             self.cad_comp_widget.cross_section_widget.update_params(cad_state)
 
     def _show_additional_inputs(self, target_tab: str | None = None):
@@ -645,7 +649,7 @@ class CustomWindow(QWidget):
         # Redefine additional input defaults if required fields changed
         # Solve bridge layout so the dict has computed values before Design or Additional Inputs
         if self.input_dock.is_require_field_changed:
-            solve_extend_basic_input_dict(self.input_dict)
+            solve_extend_basic_input_dict(self.input_dict, preserve_additional=True)
             self.input_dock.is_require_field_changed = False
 
         print("\n@@input_dictionary_after (common_design_func):\n")
@@ -748,7 +752,10 @@ class CustomWindow(QWidget):
                     loadcases = self.backend.get_available_loadcases()
                     nodes, members = self.backend.get_nodes_members()
                     edge_dist = self.backend.get_edge_dist()
-                    self.plots_widget.setup(ds_all, loadcases, nodes, members, edge_dist=edge_dist)
+                    self.plots_widget.setup(
+                        ds_all, loadcases, nodes, members, edge_dist=edge_dist,
+                        transverse_groups=self.backend.get_transverse_plot_members(members),
+                    )
                     self.plots_widget.link_output_dock(self.output_dock)
 
                     # Render 3D cad using the parameters from Backend
@@ -787,14 +794,91 @@ class CustomWindow(QWidget):
         # Connect to input dock's value changed signals
         # This will update the CAD whenever any input field changes
         if hasattr(self.input_dock, 'input_value_changed'):
-            self.input_dock.input_value_changed.connect(self.update_cad_from_inputs)        
+            self.input_dock.input_value_changed.connect(self.update_cad_from_inputs)
+
+        for canvas in (self.cad_comp_widget.cross_section_widget, self.cad_comp_widget.top_view_widget):
+            canvas.dimension_editing_enabled = self._can_edit_cad_dimension
+            canvas.dimension_edited.connect(self._apply_cad_dimension)
+
+    def _can_edit_cad_dimension(self):
+        return not self.input_dock.is_locked and not getattr(self, "_design_running", False)
+
+    def _apply_cad_dimension(self, key, text):
+        if not self._can_edit_cad_dimension():
+            return
+
+        try:
+            value = float(text)
+            if not isfinite(value) or value <= 0:
+                raise ValueError
+        except ValueError:
+            self._show_cad_input_error("Enter a finite, positive numeric value.")
+            return
+
+        basic = key in (KEY_CARRIAGEWAY_WIDTH, KEY_SPAN)
+        candidate = deepcopy(self.input_dict)
+        candidate[key] = text if basic else value
+        validator = self.input_dock.validator
+        validate = validator.validate_basic_inputs if basic else validator.validate_additional_inputs
+        error = validate(key, candidate)
+        if error is not None:
+            self._show_cad_input_error(error[1])
+            return
+
+        has_span = bool(candidate.get(KEY_SPAN))
+        has_width = bool(candidate.get(KEY_CARRIAGEWAY_WIDTH))
+        if key == KEY_TS_GIRDER_SPACING and not (has_width and has_span):
+            self._show_cad_input_error("Set the span length and carriageway width before editing girder spacing.")
+            return
+
+        if has_width and has_span and (
+            key in (KEY_CARRIAGEWAY_WIDTH, KEY_TS_GIRDER_SPACING)
+            or not candidate.get(KEY_TS_OVERALL_WIDTH)
+        ):
+            try:
+                solve_extend_basic_input_dict(
+                    candidate, preserve_additional=True,
+                    changed_field="spacing" if key == KEY_TS_GIRDER_SPACING else "girders",
+                )
+            except ValueError as error:
+                self._show_cad_input_error(str(error))
+                return
+        elif key == KEY_SPAN:
+            # The segment table stores distances in metres. Keep the end of
+            # the final segment at the end of the new span.
+            for girder in range(1, int(candidate.get(KEY_TS_NO_OF_GIRDERS) or 0) + 1):
+                segments = candidate.get(f"{KEY_MP_GD_SEGMENT_TABLE}.G{girder}", [])
+                if segments:
+                    if float(segments[-1]["start"]) >= value:
+                        self._show_cad_input_error("Span length must exceed the start of every final girder segment.")
+                        return
+                    segments[-1]["end"] = value
+
+        self.input_dict.update(candidate)
+        if basic:
+            widget = self.input_dock._w(key)
+            if isinstance(widget, QLineEdit):
+                with QSignalBlocker(widget):
+                    widget.setText(text)
+                self.input_dock.reset_error_state(widget)
+        if has_span and has_width:
+            self.input_dock.is_require_field_changed = False
+        self.cad_comp_widget.update_from_osdag_inputs(self.input_dict)
+
+    def _show_cad_input_error(self, message):
+        CustomMessageBox(
+            title="Input Error", text=message, dialogType=MessageBoxType.Warning,
+        ).exec()
             
     # Function for saving input dictionary into an OSI file
     def saveOSI_inputs(self):
         # Populate additional input defaults so they appear in the saved file
         # even if the user never opened the Additional Inputs dialog.
         try:
-            solve_extend_basic_input_dict(self.input_dict)
+            solve_extend_basic_input_dict(
+                self.input_dict, preserve_additional=True,
+                changed_field="spacing" if self.input_dict.get(KEY_TS_GIRDER_SPACING) else "girders",
+            )
         except Exception:
             pass
 
@@ -856,18 +940,17 @@ class CustomWindow(QWidget):
                 ).exec()
                 return
 
-            self.input_dock.populate_from_dict(data)
+            try:
+                solve_extend_basic_input_dict(
+                    data, preserve_additional=True,
+                    changed_field="spacing" if data.get(KEY_TS_GIRDER_SPACING) else "girders",
+                )
+            except ValueError:
+                pass
+            self.input_dock.populate_from_dict(data, resolve_layout=False)
 
-            # Sync additional inputs dialog if it has already been constructed
             if self._additional_inputs_dialog is not None:
                 self._additional_inputs_dialog.set_input_dictionary(self.input_dict)
-
-            # Refresh 2D CAD to reflect loaded values
-            try:
-                solve_extend_basic_input_dict(self.input_dict)
-                self.cad_comp_widget.update_from_osdag_inputs(self.input_dict)
-            except Exception:
-                pass
 
             CustomMessageBox(
                 title="Success",
@@ -893,7 +976,7 @@ class CustomWindow(QWidget):
         # derived layout values (girders/spacing/overhang/overall width) on-demand.
         if self.input_dock.is_require_field_changed:
             try:
-                solve_extend_basic_input_dict(self.input_dict)
+                solve_extend_basic_input_dict(self.input_dict, preserve_additional=True)
                 self.input_dock.is_require_field_changed = False
             except Exception:
                 # If solver fails mid-edit, keep raw values for best-effort redraw.

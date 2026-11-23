@@ -7,10 +7,10 @@ from copy import deepcopy
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTabWidget, QTabBar, QLabel, QLineEdit,
     QComboBox, QPushButton, QCheckBox, QSizePolicy,
-    QDialog, QSizePolicy, QSizeGrip,
+    QDialog, QSizeGrip, QStackedWidget, QRadioButton,
 )
 from PySide6.QtCore import Qt, Signal, QTimer, QPoint, QEvent
-from PySide6.QtGui import QDoubleValidator
+from PySide6.QtGui import QDoubleValidator, QTextDocument
 
 from osdagbridge.core.bridge_types.plate_girder.validator import BridgeInputValidator
 from osdagbridge.core.utils.common import *
@@ -48,6 +48,11 @@ class AdditionalInputs(QDialog):
         self.default_input_dict = {}
         # Work temporarily on a copy of default dictionary
         self.working_input_dict = {}
+        self.is_modified = False
+        self._custom_pairs = {}
+        self._custom_links = {}
+        self._custom_adaptive = {}
+        self._custom_options = {}
         # Last confirmed-good spacing and girder count; restored if solver raises an error
         self._last_good_layout: dict = {}
 
@@ -156,9 +161,19 @@ class AdditionalInputs(QDialog):
 
         action_bar, self.defaults_button, self.save_button = create_action_button_bar()
         self.defaults_button.clicked.connect(self.reset_active_tab_defaults)
+        self.defaults_button.clicked.connect(self._mark_modified)
 
-        from pprint import pprint
-        self.defaults_button.clicked.connect(lambda: pprint(self.working_input_dict))
+        selectors = {
+            KEY_MP_GD_SELECT_GIRDER, KEY_MP_GD_MEMBER_ID, KEY_MP_STIFFENER_SELECT_MEMBER_ID,
+            KEY_MP_ED_SELECT_GIRDERS, KEY_MP_CB_SELECT_GIRDERS,
+        }
+        for widget in self.tabs.findChildren(QLineEdit):
+            widget.textEdited.connect(self._mark_modified)
+        for widget in self.tabs.findChildren(QComboBox):
+            if widget.objectName() not in selectors:
+                widget.activated.connect(self._mark_modified)
+        for widget in self.tabs.findChildren(QCheckBox) + self.tabs.findChildren(QRadioButton):
+            widget.clicked.connect(self._mark_modified)
 
         self.save_button.clicked.connect(self._save_inputs)
         main_layout.addSpacing(6)
@@ -234,7 +249,7 @@ class AdditionalInputs(QDialog):
 
         self.set_defaults()
 
-        self.default_input_dict.update(self.working_input_dict)
+        self.is_modified = False
 
         self._last_good_layout = {
             KEY_TS_GIRDER_SPACING: self.working_input_dict.get(KEY_TS_GIRDER_SPACING),
@@ -257,7 +272,7 @@ class AdditionalInputs(QDialog):
             if not name or name not in self.working_input_dict:
                 continue
             value = self.working_input_dict.get(name)
-            if value is None:
+            if value is None and not isinstance(widget, QLineEdit):
                 continue
 
             if isinstance(widget, QLineEdit):
@@ -271,7 +286,7 @@ class AdditionalInputs(QDialog):
                     else:
                         text = f"{float(value):.2f}"
                 except (ValueError, TypeError):
-                    text = str(value)
+                    text = "" if value is None else str(value)
                 widget.blockSignals(True)
                 widget.setText(text)
                 widget.blockSignals(False)
@@ -291,6 +306,16 @@ class AdditionalInputs(QDialog):
                 if isinstance(value, list):
                     widget.update(value)
                 widget.blockSignals(False)
+        # Setting the combo with signals blocked still requires restoring the paired field.
+        for _, mode, value in self._custom_pairs.values():
+            if mode.objectName() not in self.working_input_dict:
+                mode.setCurrentIndex(0)
+            if value.objectName() not in self.working_input_dict and isinstance(value, QLineEdit):
+                value.clear()
+            custom = mode.currentText() == "Custom"
+            value.setVisible(custom)
+            self._set_enabled(value, custom)
+
         # ── Sync AdaptiveWidgets from working_input_dict ──────────────────────
         from osdagbridge.desktop.ui.dialogs.additional_input.ui_builder.common_ui_builder import AdaptiveWidget
         for adaptive in self.findChildren(AdaptiveWidget):
@@ -503,10 +528,93 @@ class AdditionalInputs(QDialog):
         for tab_widget in self.findChildren(QTabWidget):
             if hasattr(tab_widget, "refresh_active_tab"):
                 tab_widget.refresh_active_tab()
+        self.is_modified = False
+
+    def _mark_modified(self, *_):
+        if self.isVisible():
+            self.is_modified = True
+
+    def reject(self):
+        # Escape follows the same path as the window's close button.
+        self.close()
+
+    def closeEvent(self, event):
+        if self.is_modified:
+            result = CustomMessageBox(
+                title="Unsaved Changes",
+                text="You have unsaved changes. Closing this window will discard them. Do you want to proceed?",
+                buttons=["Discard", "Cancel"], dialogType=MessageBoxType.Warning,
+            ).exec()
+            if result != "Discard":
+                event.ignore()
+                return
+        self.working_input_dict = deepcopy(self.default_input_dict)
+        self.is_modified = False
+        event.accept()
+        super().reject()
+
+    @staticmethod
+    def _is_active_input(widget):
+        """Allow unselected tabs, but skip disabled tabs and inactive controls."""
+        if widget is None or not widget.isEnabled():
+            return False
+        child = widget
+        while (parent := child.parentWidget()) is not None:
+            if isinstance(parent, QStackedWidget) and isinstance(parent.parentWidget(), QTabWidget):
+                tabs = parent.parentWidget()
+                index = tabs.indexOf(child)
+                if not tabs.isTabEnabled(index) or not tabs.isTabVisible(index):
+                    return False
+            elif child.isHidden():
+                return False
+            child = parent
+        return True
+
+    def _missing_custom_fields(self):
+        def empty(widget):
+            text = widget.text() if isinstance(widget, QLineEdit) else widget.currentText()
+            return not text.strip()
+
+        for label, mode, value in self._custom_pairs.values():
+            if mode.currentText() == "Custom" and self._is_active_input(value) and empty(value):
+                yield label
+        for mode, keys in self._custom_links.values():
+            if mode.currentText() != "Custom" or not self._is_active_input(mode):
+                continue
+            for key in keys:
+                value = self.findChild(QLineEdit, key)
+                if self._is_active_input(value) and empty(value):
+                    label = self.findChild(QLabel, key + "_label")
+                    yield label.text() if label else key
+        for label, adaptive in self._custom_adaptive.values():
+            value = adaptive.currentWidget()
+            if (value is adaptive._mode_widgets["Custom"]
+                    and isinstance(value, (QLineEdit, QComboBox))
+                    and self._is_active_input(value) and empty(value)):
+                yield label
+        for key, (label, mode) in self._custom_options.items():
+            if mode.currentText() == "Custom" and self._is_active_input(mode):
+                gi, mi = self._get_current_girder_member_indices()
+                selected_key = f"{key}.selected.G{gi}.M{mi}"
+                selected = self.working_input_dict.get(selected_key)
+                if not selected:
+                    yield label
 
     # ── Dialog Persistence ───────────────────────────────────────────────────────
 
     def _save_inputs(self):  # on_change: validates all tabs then commits working_input_dict and emits CAD update signal
+        errors = []
+        for label in self._missing_custom_fields():
+            document = QTextDocument()
+            document.setHtml(label)
+            name = document.toPlainText().strip().rstrip(":")
+            errors.append(f"Error: The custom value for '{name}' cannot be empty.")
+        if errors:
+            CustomMessageBox(
+                title="Input Error", text="\n".join(dict.fromkeys(errors)),
+                buttons=["OK"], dialogType=MessageBoxType.Critical,
+            ).exec()
+            return
 
         # Flush the currently-displayed stiffener member's widgets before committing.
         # _save_stiffener_member_data otherwise only runs when switching *away* from a
@@ -516,7 +624,8 @@ class AdditionalInputs(QDialog):
         if combo and combo.currentText().strip():
             self._save_stiffener_member_data(combo.currentText().strip())
 
-        self.default_input_dict.update(self.working_input_dict)
+        self.default_input_dict.update(deepcopy(self.working_input_dict))
+        self.is_modified = False
         from osdagbridge.desktop.ui.docks.cad_cross_section import CrossSectionCADWidget
         cad = self.findChild(CrossSectionCADWidget, KEY_TS_CAD_PREVIEW)
         if cad:
@@ -552,6 +661,7 @@ class AdditionalInputs(QDialog):
             return
 
         if isinstance(widget, dict):
+            self._mark_modified()
             self._update_input_dict(key, widget)
             return
 
@@ -561,6 +671,7 @@ class AdditionalInputs(QDialog):
             return
 
         if isinstance(widget, list):
+            self._mark_modified()
             self._update_input_dict(key, widget)
             return
 
@@ -678,36 +789,19 @@ class AdditionalInputs(QDialog):
         self._apply_tab_active_conditions(self._TYPICAL_SECTION_TAB_CONDITIONS)
         self._apply_widget_active_conditions(self._TYPICAL_SECTION_WIDGET_CONDITIONS)
 
-        # Refresh crash barrier for correct compute value
-        cb_type = self.findChild(QComboBox, KEY_CB_TYPE)
-        if cb_type:
-            # To fix some issue of not updating first time
-            cur = cb_type.currentText()
-            cb_type.setCurrentText("IRC 5 - High Containment RCC Crash Barrier")
-            cb_type.setCurrentText(cur)
-
-        # Refresh median for correct compute value
-        md_type = self.findChild(QComboBox, KEY_MD_TYPE)
-        if md_type:
-            cur = md_type.currentText()
-            md_type.setCurrentText("IRC 5 - Raised Kerb")
-            md_type.setCurrentText(cur)
-
-        # Refresh railing for correct compute value
-        rl_type = self.findChild(QComboBox, KEY_RL_TYPE)
-        if rl_type:
-            cur = rl_type.currentText()
-            other = "IRC 5 - Steel Railing" if cur != "IRC 5 - Steel Railing" else "IRC 5 - RCC Railing"
-            rl_type.setCurrentText(other)
-            rl_type.setCurrentText(cur)
-
-        # Refresh wearing course for correct compute value
-        wc_mat = self.findChild(QComboBox, KEY_WC_MATERIAL)
-        if wc_mat:
-            cur = wc_mat.currentText()
-            other = "Bituminous" if cur != "Bituminous" else "Concrete"
-            wc_mat.setCurrentText(other)
-            wc_mat.setCurrentText(cur)
+        # Restore field availability without turning a tab visit into a geometry edit.
+        for key, refresh in (
+            (KEY_CB_TYPE, lambda text: self.on_crash_barrier_type_changed(text, update_layout=False)),
+            (KEY_MD_TYPE, lambda text: self.on_median_type_changed(text, update_layout=False)),
+            (KEY_RL_TYPE, lambda text: self.on_railing_type_changed(text, update_layout=False)),
+            (KEY_WC_MATERIAL, self.on_wearing_material_changed),
+        ):
+            combo = self.findChild(QComboBox, key)
+            if combo is not None:
+                refresh(combo.currentText())
+        mode = self.findChild(QComboBox, KEY_RL_LOAD_MODE)
+        if mode is not None:
+            self.on_railing_load_mode_changed(mode.currentText())
 
     # ── Typical Section - Primary Fields ───────────────────────────────────────────────────────
 
@@ -864,7 +958,7 @@ class AdditionalInputs(QDialog):
     def _is_metallic_barrier(t: str) -> bool:
         return t.startswith("IRC 5 - Metallic Crash Barrier")
 
-    def on_crash_barrier_type_changed(self, barrier_type: str):
+    def on_crash_barrier_type_changed(self, barrier_type: str, *, update_layout=True):
         is_rcc      = self._is_rcc_barrier(barrier_type)
         is_metallic = self._is_metallic_barrier(barrier_type)
         is_custom   = barrier_type == "Custom"
@@ -893,7 +987,8 @@ class AdditionalInputs(QDialog):
         result = self.compute_crash_barrier_values(self.working_input_dict)
         for k, v in result.items():
             self._update_input_dict(k, str(v))
-        self.update_girder_layout()
+        if update_layout:
+            self.update_girder_layout()
 
     def compute_crash_barrier_values(self, input_dict: dict) -> dict:
         from osdagbridge.core.utils.codes.irc5_2015 import IRC5_2015
@@ -965,7 +1060,7 @@ class AdditionalInputs(QDialog):
 
     # ── Median Sub-Tab ────────────────────────────────────────────────────────────────────
 
-    def on_median_type_changed(self, median_type: str):
+    def on_median_type_changed(self, median_type: str, *, update_layout=True):
         is_rcc      = median_type in ("IRC 5 - Raised Kerb", "IRC 5 - RCC Crash Barrier")
         is_metallic = "Metallic" in median_type
         is_custom   = median_type == "Custom"
@@ -994,7 +1089,8 @@ class AdditionalInputs(QDialog):
         result = self.compute_median_values(self.working_input_dict)
         for k, v in result.items():
             self._update_input_dict(k, str(v))
-        self.update_girder_layout()
+        if update_layout:
+            self.update_girder_layout()
 
     def compute_median_values(self, input_dict: dict) -> dict:
         from osdagbridge.core.utils.codes.irc5_2015 import IRC5_2015
@@ -1049,12 +1145,13 @@ class AdditionalInputs(QDialog):
 
     # ── Railing Sub-Tab ──────────────────────────────────────────────────────────────────────
 
-    def on_railing_type_changed(self, railing_type: str):
+    def on_railing_type_changed(self, railing_type: str, *, update_layout=True):
         # Pre-apply new width so update_girder_layout uses the correct overall width
         result = self.compute_railing_values(self.working_input_dict)
         for k, v in result.items():
             self._update_input_dict(k, str(v))
-        self.update_girder_layout()
+        if update_layout:
+            self.update_girder_layout()
 
     def compute_railing_values(self, input_dict: dict) -> dict:
         from osdagbridge.core.utils.codes.irc5_2015 import IRC5_2015
@@ -1304,6 +1401,8 @@ class AdditionalInputs(QDialog):
         idx = combo.currentIndex()   # 0-based → G1 = index 0
         girder_key = f"{KEY_MP_GD_SEGMENT_TABLE}.G{idx + 1}"
 
+        if self.working_input_dict.get(girder_key) != segments:
+            self._mark_modified()
         self.working_input_dict[girder_key] = segments
 
         cad = self.findChild(QWidget, KEY_MP_GD_CAD_PREVIEW)
@@ -1472,6 +1571,7 @@ class AdditionalInputs(QDialog):
     def _on_all_custom_selected(self, field_id: str, chosen: list) -> None:  # on_change: stores TYPE_ALL_CUSTOM selection list under the current member's dynamic key
         gi, mi = self._get_current_girder_member_indices()
         suffix = f".G{gi}.M{mi}"
+        self._mark_modified()
         self.working_input_dict[field_id + ".selected" + suffix] = chosen
         self.working_input_dict[field_id + suffix] = "Custom"
         print(f"[ALL_CUSTOM_SELECTED] {field_id}.selected{suffix} = {chosen}")
@@ -1485,6 +1585,7 @@ class AdditionalInputs(QDialog):
             self.working_input_dict[new_key] = copy.deepcopy(self.working_input_dict[k])
 
     def _on_apply_exterior_clicked(self) -> None:  # on_change: applies current girder settings to first and last girders
+        self._mark_modified()
         gi, _ = self._get_current_girder_member_indices()
         count = int(float(str(self.working_input_dict.get(KEY_TS_NO_OF_GIRDERS, 1))))
         targets = {1, count} - {gi}
@@ -1493,6 +1594,7 @@ class AdditionalInputs(QDialog):
         print(f"@@: Applied Girder {gi} settings to exterior girders: {targets}")
 
     def _on_apply_interior_clicked(self) -> None:  # on_change: applies current girder settings to all interior girders
+        self._mark_modified()
         gi, _ = self._get_current_girder_member_indices()
         count = int(float(str(self.working_input_dict.get(KEY_TS_NO_OF_GIRDERS, 1))))
         targets = set(range(2, count)) - {gi}
@@ -1904,6 +2006,7 @@ class AdditionalInputs(QDialog):
         self._update_stiffener_cad()
 
     def _on_stiffener_apply_all_clicked(self) -> None:  # on_click: copies current stiffener config to all other girders/members
+        self._mark_modified()
         import re
         combo = self.findChild(QComboBox, KEY_MP_STIFFENER_SELECT_MEMBER_ID)
         if combo is None:

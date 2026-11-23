@@ -244,7 +244,7 @@ class FrontendData:
     def output_values(self, flag=None):
         return [
             # ── Analysis Results ──────────────────────────────────────────────
-            (KEY_SECTION_OUTPUT_ANALYSIS, "Girder Analysis Results",
+            (KEY_SECTION_OUTPUT_ANALYSIS, "Member Analysis Results",
                 TYPE_TITLE, None, True, "No Validator",
                 {"kind": "analysis"}),
 

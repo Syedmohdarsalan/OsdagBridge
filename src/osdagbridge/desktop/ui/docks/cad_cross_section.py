@@ -16,7 +16,10 @@ from osdagbridge.desktop.cad.irc5_geometry import (
 )
 
 
-class CrossSectionCADWidget(QWidget):
+from .cad_dimension_editor import CADDimensionCanvas
+
+
+class CrossSectionCADWidget(CADDimensionCanvas):
     """Widget for drawing bridge cross-section view"""
     # ===== SHARED CAD COLORS =====
     GIRDER_COLOR = QColor(179, 180, 160) 
@@ -722,6 +725,7 @@ class CrossSectionCADWidget(QWidget):
 
         
     def paintEvent(self, event):
+        self.dimension_labels.clear()
         # Position buttons on first paint if not done yet
         if hasattr(self, 'zoom_in_btn') and not hasattr(self, '_buttons_positioned'):
             self._position_zoom_buttons()
@@ -741,7 +745,7 @@ class CrossSectionCADWidget(QWidget):
             painter.end() 
     def draw_text_with_background(self, painter, x, y, text,
                                bg_color=QColor(255, 255, 255, 230), 
-                               text_color=QColor(0, 0, 0), font_size=9, bold=False):
+                               text_color=QColor(0, 0, 0), font_size=9, bold=False, *, dimension=None):
 
         # defensive check: font size must be > 0
         font_size = max(1, font_size)
@@ -767,6 +771,8 @@ class CrossSectionCADWidget(QWidget):
             total_height + 2 * padding
         )
 
+        self.register_dimension_label(bg_rect, dimension)
+
         painter.setPen(Qt.NoPen)
         painter.setBrush(QBrush(bg_color))
         painter.drawRect(bg_rect)
@@ -779,7 +785,7 @@ class CrossSectionCADWidget(QWidget):
             painter.drawText(int(x), int(first_line_y + i * line_height), line)
 
     
-    def draw_dimension_arrow(self, painter, x1, y1, x2, y2, text, horizontal=True, offset=0, text_offset=0, draw_extensions=True, extension_direction='down', extension_end_y=None):
+    def draw_dimension_arrow(self, painter, x1, y1, x2, y2, text, horizontal=True, offset=0, text_offset=0, draw_extensions=True, extension_direction='down', extension_end_y=None, *, dimension=None):
         """dimension line with arrows and text with extension lines"""
         painter.setPen(QPen(QColor(0, 0, 0), 0.8))
         
@@ -847,7 +853,7 @@ class CrossSectionCADWidget(QWidget):
             text_width = metrics.boundingRect(text).width()
             
             self.draw_text_with_background(painter, text_x - text_width/2, text_y, text, 
-                                        QColor(255, 255, 255, 255), QColor(0, 0, 0), 9, False)
+                                        QColor(255, 255, 255, 255), QColor(0, 0, 0), 9, False, dimension=dimension)
         else:
             top_arrow = [
                 QPointF(x1, y1),
@@ -2122,7 +2128,8 @@ class CrossSectionCADWidget(QWidget):
                 label_cw += f" = {cw_m:.2f} m"
             
             self.draw_dimension_arrow(painter, actual_cw_start, Y_TOP_COMMON, median_start_x, Y_TOP_COMMON,
-                                    label_cw, True, 
+                                    label_cw, True,
+                                    dimension=(KEY_CARRIAGEWAY_WIDTH, cw_m, "m"),
                                     extension_direction='down',
                                     extension_end_y=deck_top_y)
             
@@ -2139,7 +2146,8 @@ class CrossSectionCADWidget(QWidget):
             
             # Right carriageway - ends exactly at right barrier visual start
             self.draw_dimension_arrow(painter, median_end_x, Y_TOP_COMMON, actual_cw_end, Y_TOP_COMMON,
-                                    label_cw, True, 
+                                    label_cw, True,
+                                    dimension=(KEY_CARRIAGEWAY_WIDTH, cw_m, "m"),
                                     extension_direction='down',
                                     extension_end_y=deck_top_y)
         else:
@@ -2151,7 +2159,8 @@ class CrossSectionCADWidget(QWidget):
                 label_cw += f" = {cw_m:.2f} m"
             
             self.draw_dimension_arrow(painter, actual_cw_start, Y_TOP_COMMON, actual_cw_end, Y_TOP_COMMON,
-                                    label_cw, True, 
+                                    label_cw, True,
+                                    dimension=(KEY_CARRIAGEWAY_WIDTH, cw_m, "m"),
                                     extension_direction='down',
                                     extension_end_y=deck_top_y)
         
@@ -2206,7 +2215,8 @@ class CrossSectionCADWidget(QWidget):
                 label_gs += f" = {gs_m:.2f} m"
                 
             self.draw_dimension_arrow(painter, x_left, Y_GIRDER_SPACING, x_right, Y_GIRDER_SPACING,
-                                    label_gs, True, 
+                                    label_gs, True,
+                                    dimension=(KEY_TS_GIRDER_SPACING, gs_m, "m"),
                                     extension_direction='up',
                                     extension_end_y=base_y)
         
@@ -2277,7 +2287,7 @@ class CrossSectionCADWidget(QWidget):
             # Renamed to "Deck Thickness"
             text = "Deck Thickness"
             if self.show_carriageway_values:
-                text += f" = {deck_t_mm:.0f} mm"
+                text += f" = {deck_t_mm:g} mm"
             font = QFont('Arial', 9, QFont.Normal)
             painter.setFont(font)
             metrics = painter.fontMetrics()
@@ -2286,7 +2296,8 @@ class CrossSectionCADWidget(QWidget):
             text_y = local_deck_top_y - 8
             
             self.draw_text_with_background(painter, text_x, text_y, text,
-                                        QColor(255, 255, 255, 255), QColor(0, 0, 0), 9, False)
+                                        QColor(255, 255, 255, 255), QColor(0, 0, 0), 9, False,
+                                        dimension=(KEY_TS_DECK_THICKNESS, deck_t_mm, "mm"))
     def add_cross_section_hover_labels(self, painter, carriageway_start_x, carriageway_end_x,
                     left_barrier_x, right_barrier_x, deck_top_y, deck_bottom_y,
                     deck_thick_px, positions, base_y, scale, n, fp_config,

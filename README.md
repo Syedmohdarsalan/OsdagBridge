@@ -11,6 +11,21 @@ Additional bridge types can be added through the plugin architecture.
 
 ---
 
+## Desktop Enhancements Submission
+
+Submitted by Syed Mohammed Arsalan.
+
+This fork adds inline editing for 2D CAD dimensions, validation and unsaved-change protection for Additional Inputs, and load-case plots for end diaphragms and intermediate cross bracings.
+
+The desktop app was launched successfully on Windows using the Conda environment defined in `environment.yml`. From the project root, run:
+
+```bash
+conda activate osdagbridge-env
+python -m osdagbridge.desktop
+```
+
+---
+
 ## Key Features
 
 ### Shared Core Architecture

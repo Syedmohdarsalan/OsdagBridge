@@ -1045,7 +1045,7 @@ class InputDock(QWidget):
         else:
             print("[ERROR]: template_page.input_dictionary Not Found")
 
-    def populate_from_dict(self, data: dict) -> None:
+    def populate_from_dict(self, data: dict, *, resolve_layout: bool = True) -> None:
         """
         Push all values from *data* into the input dock widgets and parent.input_dict.
         Called after loading an OSI file.  Signals are blocked while setting
@@ -1080,7 +1080,7 @@ class InputDock(QWidget):
 
         # Mark required fields as changed so solve_extend_basic_input_dict
         # runs on the next Design call and derives all computed defaults.
-        self.is_require_field_changed = True
+        self.is_require_field_changed = resolve_layout
         self.input_value_changed.emit()
 
     # ══════════════════════════════════════════════════════════════════════════

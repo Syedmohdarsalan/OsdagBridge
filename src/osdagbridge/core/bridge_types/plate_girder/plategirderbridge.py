@@ -23,6 +23,7 @@ from .initial_sizing import DEFAULT_FOOTPATH_WIDTH
 from .analyser import BridgeGrillageModel
 from osdagbridge.core.utils.memory_guard import OpsMemoryGuard, log_memory, tracemalloc_mark_start
 from .analysis_results import PlateGirderAnalysisResults
+from .results_data import _build_nodes_members, transverse_plot_members
 from .designer import run_design_check
 from . import deckdesign
 from .plot_generator import (
@@ -31,7 +32,6 @@ from .plot_generator import (
     # build_figure_bmd_contour,  # commented out
     build_figure_deflection,
     build_figure_grillage,
-    build_nodes_members,
     figure_to_bytes,
 )
 from osdagbridge.core.utils.codes.irc6_2017 import IRC6_2017
@@ -3908,7 +3908,11 @@ class PlateGirderBridge:
 
     def get_nodes_members(self) -> tuple[dict, dict]:
         """Return (nodes, members) dicts built from the active openseespy model."""
-        return build_nodes_members()
+        return _build_nodes_members()
+
+    def get_transverse_plot_members(self, members: dict) -> dict[str, list[int]]:
+        """Return the transverse analysis groups for the current result dataset."""
+        return transverse_plot_members(self.grillage_model.model, self.result_data, members)
 
     def get_edge_dist(self) -> float:
         """Return the deck overhang distance (0.0 when no overhang)."""

@@ -17,7 +17,10 @@ from PySide6.QtCore import Qt, QEvent, QTimer
 from navcube import NavCubeOverlay, NavCubeStyle
 from osdagbridge.desktop.ui.utils.mpl_widget_navcube_sync import MatplotlibNavCubeSync
 
+from osdagbridge.core.utils.common import KEY_ANALYSIS_MEMBER, KEY_ANALYSIS_LOAD_COMBINATION
+from osdagbridge.core.bridge_types.plate_girder.results_data import transverse_loadcase_values
 from osdagbridge.core.bridge_types.plate_girder.plot_generator import (
+    build_figure_transverse,
     build_figure_sfd,
     build_figure_bmd,
     build_figure_deflection,
@@ -136,13 +139,13 @@ class SummaryOverlay(QFrame):
         self.text_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         layout.addWidget(self.text_label)
 
-    def update_data(self, summary_data, unit=""):
+    def update_data(self, summary_data, unit="", *, member_heading="Girder"):
         title = "Extreme Values Summary"
         if unit:
             title += f" ({unit})"
         hud_text = f"<b>{title}</b><br>" + "-" * 38 + "<br>"
 
-        h_girder = "Girder".ljust(8).replace(" ", "&nbsp;")
+        h_girder = member_heading.ljust(8).replace(" ", "&nbsp;")
         h_max = "Max".rjust(10).replace(" ", "&nbsp;")
         h_min = "Min".rjust(12).replace(" ", "&nbsp;")
         
@@ -171,6 +174,7 @@ class MplPlotWidget(QWidget):
         self._loadcases = []
         self._nodes     = {}
         self._members   = {}
+        self._transverse_groups = {}
         self._edge_dist = 0.0
         self._output_dock = None
         self._summary_data = {}
@@ -339,6 +343,7 @@ class MplPlotWidget(QWidget):
         self._loadcases = []
         self._nodes     = {}
         self._members   = {}
+        self._transverse_groups = {}
         self._output_dock = None
         self._summary_data = {}
         self._cb_max = None
@@ -362,17 +367,17 @@ class MplPlotWidget(QWidget):
             return
         from osdagbridge.desktop.ui.utils.custom_widgets import CustomRadioButton
 
-        combo_lc = self._output_dock.output_widget.findChild(QComboBox, "analysis.load_combination")
+        combo_lc = self._output_dock.output_widget.findChild(QComboBox, KEY_ANALYSIS_LOAD_COMBINATION)
         if combo_lc is not None:
             try:
                 combo_lc.currentTextChanged.disconnect(self.update_plot)
             except RuntimeError:
                 pass
 
-        combo_member = self._output_dock.output_widget.findChild(QComboBox, "analysis.member")
+        combo_member = self._output_dock.output_widget.findChild(QComboBox, KEY_ANALYSIS_MEMBER)
         if combo_member is not None:
             try:
-                combo_member.currentTextChanged.disconnect(self.update_plot)
+                combo_member.currentTextChanged.disconnect(self._plot_member_changed)
             except RuntimeError:
                 pass
 
@@ -407,11 +412,12 @@ class MplPlotWidget(QWidget):
                     pass
 
     def setup(self, ds_all, loadcases: list, nodes: dict, members: dict,
-              edge_dist: float = 0.0):
+              edge_dist: float = 0.0, transverse_groups=None):
         self._ds_all    = ds_all
         self._loadcases = list(loadcases)
         self._nodes     = nodes
         self._members   = members
+        self._transverse_groups = transverse_groups or {}
         self._edge_dist = edge_dist
 
         if hasattr(self, '_fig') and self._fig.axes:
@@ -426,10 +432,11 @@ class MplPlotWidget(QWidget):
             self._fig.subplots_adjust(left=-0.05, right=1.05, bottom=-0.05, top=1.05)
 
     def link_output_dock(self, output_dock):
+        self._disconnect_output_dock_signals()
         self._output_dock = output_dock
 
         # 1. Connect Load Combinations
-        combo_lc = output_dock.output_widget.findChild(QComboBox, "analysis.load_combination")
+        combo_lc = output_dock.output_widget.findChild(QComboBox, KEY_ANALYSIS_LOAD_COMBINATION)
         if combo_lc is not None:
             # Hide the per-position moving load cases ("Moving Case1", ...) —
             # they are numerous and clutter the dropdown. The dataset still
@@ -447,11 +454,12 @@ class MplPlotWidget(QWidget):
             combo_lc.currentTextChanged.connect(self.update_plot)
 
         # Connect Analysis Member Dropdown
-        combo_member = output_dock.output_widget.findChild(QComboBox, "analysis.member")
+        combo_member = output_dock.output_widget.findChild(QComboBox, KEY_ANALYSIS_MEMBER)
         if combo_member is not None:
-            combo_member.currentTextChanged.connect(self.update_plot)
-            # Make sure it fires an update if changed from UI, since grillage might be active
-            combo_member.currentTextChanged.connect(lambda text: self._on_grillage_toggled(self._grillage_mode) if self._grillage_mode else None)
+            for label in self._transverse_groups:
+                if combo_member.findText(label) < 0:
+                    combo_member.addItem(label)
+            combo_member.currentTextChanged.connect(self._plot_member_changed)
 
         # 2. Connect Force Radios
         from osdagbridge.desktop.ui.utils.custom_widgets import CustomRadioButton
@@ -500,10 +508,19 @@ class MplPlotWidget(QWidget):
             return
         self.update_plot()
 
+    def _plot_member_changed(self):
+        if self._grillage_mode:
+            self._on_grillage_toggled(True)
+        else:
+            self.update_plot()
+
+    def _selected_transverse_members(self, label):
+        return {tag: self._members[tag] for tag in self._transverse_groups[label]}
+
     def _current_member(self):
         if self._output_dock is None:
             return "All"
-        combo_member = self._output_dock.output_widget.findChild(QComboBox, "analysis.member")
+        combo_member = self._output_dock.output_widget.findChild(QComboBox, KEY_ANALYSIS_MEMBER)
         if combo_member and combo_member.currentText() != "-":
             return combo_member.currentText()
         return "All"
@@ -522,7 +539,6 @@ class MplPlotWidget(QWidget):
         if not loadcase or not force_key:
             return
 
-        ds = self._ds_all.sel(Loadcase=loadcase)
         
         old_elev, old_azim = None, None
         if hasattr(self, '_fig') and self._fig and self._fig.axes:
@@ -538,21 +554,33 @@ class MplPlotWidget(QWidget):
 
         # (Your existing if/elif/else block to build the new figures)
         eng_scale = self._eng_scale
-        if force_key in _SFD_KEYS:
+        transverse = sel_girder in self._transverse_groups
+        if transverse:
+            members = self._selected_transverse_members(sel_girder)
+            displacement = force_key in _DEFL_KEYS
+            components = (force_key[1].lower(),) if displacement else FORCE_MAP[force_key]
+            values = transverse_loadcase_values(
+                self._ds_all, loadcase, members, components, displacement=displacement,
+            )
+            self._fig, self._summary_data = build_figure_transverse(
+                self._nodes, members, sel_girder, values=values, plot_key=force_key,
+                eng_scale=eng_scale,
+            )
+        elif force_key in _SFD_KEYS:
             self._fig, self._summary_data = build_figure_sfd(
-                ds, force_key, self._nodes, self._members,
+                self._ds_all.sel(Loadcase=loadcase), force_key, self._nodes, self._members,
                 edge_dist=self._edge_dist, eng_scale=eng_scale,
                 selected_girder=sel_girder
             )
         elif force_key in _DEFL_KEYS:
             self._fig, self._summary_data = build_figure_deflection(
-                ds, force_key, self._nodes, self._members,
+                self._ds_all.sel(Loadcase=loadcase), force_key, self._nodes, self._members,
                 edge_dist=self._edge_dist, eng_scale=eng_scale,
                 selected_girder=sel_girder
             )
         else:
             self._fig, self._summary_data = build_figure_bmd(
-                ds, force_key, self._nodes, self._members,
+                self._ds_all.sel(Loadcase=loadcase), force_key, self._nodes, self._members,
                 edge_dist=self._edge_dist, eng_scale=eng_scale,
                 selected_girder=sel_girder
             )
@@ -574,6 +602,7 @@ class MplPlotWidget(QWidget):
             self._summary_overlay.update_data(
                 self._summary_data,
                 unit=self._value_unit_for_force_key(force_key),
+                member_heading="Members" if transverse else "Girder",
             )
             if self._is_summary_checked:
                 self._summary_overlay.show()
@@ -588,8 +617,10 @@ class MplPlotWidget(QWidget):
                 return
 
             ax = self._fig.axes[0]
-            if old_elev is not None and old_azim is not None:
+            if (old_elev is not None and old_azim is not None
+                    and transverse == getattr(self, "_was_transverse", False)):
                 ax.view_init(elev=old_elev, azim=old_azim)
+            self._was_transverse = transverse
 
             title = ax.get_title()
             ax.set_title("")
@@ -716,7 +747,14 @@ class MplPlotWidget(QWidget):
                 old_azim = self._fig.axes[0].azim
             plt.close(self._fig)
             sel_girder = self._current_member()
-            self._fig = build_figure_grillage(self._nodes, self._members, edge_dist=self._edge_dist, selected_girder=sel_girder)
+            if sel_girder in self._transverse_groups:
+                self._fig, _ = build_figure_transverse(
+                    self._nodes, self._selected_transverse_members(sel_girder), sel_girder,
+                )
+            else:
+                self._fig = build_figure_grillage(
+                    self._nodes, self._members, edge_dist=self._edge_dist, selected_girder=sel_girder,
+                )
             self._attach_figure(self._fig)
             if self._fig.axes and old_elev is not None and old_azim is not None:
                 self._fig.axes[0].view_init(elev=old_elev, azim=old_azim)
@@ -1478,7 +1516,7 @@ class MplPlotWidget(QWidget):
 
     def _current_loadcase(self) -> str:
         combo = self._output_dock.output_widget.findChild(
-            QComboBox, "analysis.load_combination"
+            QComboBox, KEY_ANALYSIS_LOAD_COMBINATION
         )
         return combo.currentText() if combo else (self._loadcases[0] if self._loadcases else "")
 

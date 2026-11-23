@@ -821,6 +821,8 @@ class UIBuilder(QWidget):
             widget = AdaptiveWidget(ctrl_id, mode_widgets, ai, field_id)
             widget.setObjectName(field_id)
 
+            if ai and "Custom" in mode_widgets:
+                ai._custom_adaptive[field_id] = (field_def.get("label", field_id), widget)
             return widget
 
         elif ftype == TYPE_DIRECT_WIDGET:
@@ -941,6 +943,8 @@ class UIBuilder(QWidget):
 
         # ── Signal wiring ──────────────────────────────────────────────────
         if ftype in (TYPE_COMBOBOX):
+            if ai and field_def.get("custom_inputs"):
+                ai._custom_links[field_id] = (field, field_def["custom_inputs"])
             if ai and field_id:
                 field.currentTextChanged.connect(
                     lambda text, k=field_id: ai._on_field_edited(k, text)
@@ -1263,6 +1267,9 @@ class UIBuilder(QWidget):
                 if func_name not in ai._compute_functions:
                     ai._compute_functions.append(func_name)
 
+        if ai and "Custom" in choices:
+            ai._custom_pairs[field_id] = (field_def.get("label", field_id), mode_combo, value_input)
+
         h.addWidget(mode_combo, 1)
         h.addWidget(value_input, 1)
 
@@ -1382,6 +1389,9 @@ class UIBuilder(QWidget):
                 # ── Register for batch call at design time ──
                 if func_name not in ai._compute_functions:
                     ai._compute_functions.append(func_name)
+
+        if ai and "Custom" in mode_choices:
+            ai._custom_pairs[field_id] = (field_def.get("label", field_id), mode_combo, value_combo)
 
         h.addWidget(mode_combo, 1)
         h.addWidget(value_combo, 1)
@@ -1599,8 +1609,12 @@ class UIBuilder(QWidget):
                 _combo.blockSignals(True)
                 _combo.setCurrentText("All")
                 _combo.blockSignals(False)
+                if _ai:
+                    _ai._on_field_edited(_fid, "All")
 
         combo.currentTextChanged.connect(_on_changed)
+        if ai:
+            ai._custom_options[field_id] = (field_def.get("label", field_id), combo)
         return combo
     
     @staticmethod
